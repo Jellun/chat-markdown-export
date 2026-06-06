@@ -50,7 +50,6 @@ newest session is pre-selected instead. Sessions are always listed newest-first.
 
 | Setting | Default | Description |
 | --- | --- | --- |
-| `chatMarkdownExport.includeReasoning` | `false` | Include the assistant's internal "thinking" blocks in collapsible `<details>` sections. |
 | `chatMarkdownExport.openAfterExport` | `true` | Open the exported file after writing it. |
 | `chatMarkdownExport.overwriteExisting` | `true` | Overwrite an existing file of the same name; when `false`, a ` (2)` suffix is added. |
 
@@ -80,16 +79,34 @@ want to hack on it:
   npm install -g @vscode/vsce
   cd chat-markdown-export
   vsce package
-  code --install-extension chat-markdown-export-0.5.1.vsix
+  code --install-extension chat-markdown-export-0.5.7.vsix
   ```
 
 ## Notes & limitations
 
 - The on-disk session format is internal to VS Code and may change between versions;
   the parser is defensive and skips parts it doesn't recognize.
-- Rich response parts (file edits, tool calls) are summarized as short notes; plain
-  prose, code blocks, and inline file references are exported in full.
-- **The most recent reply may export blank.** VS Code writes chat history to disk
-  lazily, so the latest assistant turn is often still buffered in memory when you run
-  the export. When that happens the turn is marked *"response not yet saved to disk"*
-  and a warning is shown — just wait a few seconds and run the export again to capture it.
+- Plain prose, code blocks, and inline file references from the assistant's final
+  answer are exported. Internal reasoning/thinking blocks, tool calls, edit records,
+  command/status updates, and agent progress notes are omitted.
+- **The export mirrors what VS Code shows, not the raw on-disk log.** VS Code's
+  append-only journal keeps artifacts its UI hides: aborted or superseded attempts (left
+  behind when you cancel or re-send a prompt) and tool calls that are serialized twice
+  (once on completion, then again once a short title is generated). The exporter drops
+  interior aborted attempts, hides generated `@agent Continue` control prompts while
+  merging their assistant output into the previous visible user turn,
+  collapses an identical re-sent prompt into its final answer only when the earlier
+  request is superseded or empty, de-duplicates the repeated tool calls (by their call
+  id) and progressive markdown snapshots, and otherwise preserves every distinct turn
+  in its original order.
+- **The most recent turns may export incomplete.** VS Code writes the chat **journal**
+  to disk **lazily and in request order**, so during a long, active session the last few
+  turns are often still buffered — a reply can be missing or truncated. To close that
+  gap, the exporter reads GitHub Copilot's sibling **transcript** (which VS Code updates
+  promptly) and **backfills** any trailing turn the journal hasn't finalized, matching by
+  prompt text; recovered turns are marked with a small *"Recovered from the live chat
+  transcript"* note. A turn that is in neither source yet (e.g. a reply still streaming as
+  you export) is flagged with a warning, and a notification reports how many turns were
+  recovered and how many are still pending — just re-export once the reply has finished.
+  Backfill applies only to Copilot sessions; other chat providers fall back to the
+  journal alone.

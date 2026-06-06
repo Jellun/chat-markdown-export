@@ -105,7 +105,25 @@ async function exportSession(session, workspaceFolder) {
 	}
 
 	const config = vscode.workspace.getConfiguration('chatMarkdownExport');
-	const opts = { includeReasoning: config.get('includeReasoning', false), stats: { pendingTurns: 0 } };
+	const opts = {
+		stats: { pendingTurns: 0, recoveredTurns: 0 },
+	};
+
+	// VS Code writes the chatSessions journal lazily and in request order, so the
+	// most recent turns of an active session are often missing or truncated there.
+	// The sibling Copilot transcript is updated more promptly, so we use it to
+	// backfill any turn the journal has not finalized yet. Best-effort: if the
+	// transcript is absent (e.g. a non-Copilot session) we keep the journal data.
+	try {
+		const transcriptFile = getTranscriptPath(session.file, session.id);
+		if (transcriptFile && fs.existsSync(transcriptFile) && state && Array.isArray(state.requests)) {
+			const turns = parseTranscriptTurns(transcriptFile);
+			opts.stats.recoveredTurns = backfillFromTranscript(state.requests, turns);
+		}
+	} catch (_) {
+		/* transcript backfill is best-effort; fall back to the journal alone */
+	}
+
 	const markdown = renderMarkdown(state, opts);
 
 	// Write into a "vschats" subfolder of the workspace root, creating it if needed.
@@ -128,11 +146,28 @@ async function exportSession(session, workspaceFolder) {
 	vscode.window.showInformationMessage(
 		'Chat Markdown Export: saved "' + fileName + '" to the ' + OUTPUT_FOLDER + ' folder.'
 	);
-	if (opts.stats.pendingTurns > 0) {
-		vscode.window.showWarningMessage(
-			'Chat Markdown Export: the latest reply was not fully saved to disk yet, so it appears blank in the export. '
-			+ 'VS Code writes chat history lazily \u2014 wait a few seconds, then run the export again to capture it.'
-		);
+	const recovered = opts.stats.recoveredTurns;
+	const pending = opts.stats.pendingTurns;
+	if (recovered > 0 || pending > 0) {
+		const notes = [];
+		if (recovered > 0) {
+			notes.push(
+				'recovered ' + recovered + ' recent turn' + (recovered === 1 ? '' : 's')
+				+ ' from the live chat transcript'
+			);
+		}
+		if (pending > 0) {
+			notes.push(
+				pending + ' turn' + (pending === 1 ? '' : 's') + ' ' + (pending === 1 ? 'was' : 'were')
+				+ ' still being written and may be blank or incomplete \u2014 re-export once the reply has finished'
+			);
+		}
+		const summary = 'Chat Markdown Export: ' + notes.join('; ') + '.';
+		if (pending > 0) {
+			vscode.window.showWarningMessage(summary);
+		} else {
+			vscode.window.showInformationMessage(summary);
+		}
 	}
 }
 
@@ -498,16 +533,264 @@ function appendAtPath(root, keyPath, items) {
 }
 
 // ---------------------------------------------------------------------------
+// Transcript backfill
+// ---------------------------------------------------------------------------
+//
+// The chatSessions journal is written lazily and in request order, so the latest
+// turns of an active session are often unwritten or truncated. The GitHub Copilot
+// Chat extension also keeps a structured transcript that VS Code updates promptly:
+//   <hash>/GitHub.copilot-chat/transcripts/<sessionId>.jsonl
+// It is a JSONL event log; we use two event types:
+//   {"type":"user.message","data":{"content":"..."}}
+//   {"type":"assistant.message","data":{"content":"..."}}
+// A turn is a user.message followed by the assistant.message parts up to the next
+// user.message. We reconstruct those turns and, for any journal turn that is not
+// finalized, splice in the matching transcript reply (matched by user text). The
+// transcript can be missing some turns and is not index-aligned with the journal,
+// so we align the two sequences from the end and match on prompt text.
+
+/**
+ * Resolve the Copilot transcript for a session from its journal path.
+ * <hash>/chatSessions/<id>.jsonl -> <hash>/GitHub.copilot-chat/transcripts/<id>.jsonl
+ * @param {string} journalFile
+ * @param {string} sessionId
+ * @returns {string}
+ */
+function getTranscriptPath(journalFile, sessionId) {
+	const hashDir = path.dirname(path.dirname(journalFile));
+	return path.join(hashDir, 'GitHub.copilot-chat', 'transcripts', sessionId + '.jsonl');
+}
+
+/** Collapse all runs of whitespace to single spaces and trim. */
+function normWhitespace(value) {
+	return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Parse a Copilot transcript into ordered turns: the user prompt and the
+ * concatenated visible assistant reply for each.
+ * @param {string} file
+ * @returns {{ user: string, reply: string }[]}
+ */
+function parseTranscriptTurns(file) {
+	let raw;
+	try {
+		raw = fs.readFileSync(file, 'utf8');
+	} catch (_) {
+		return [];
+	}
+	const turns = [];
+	let current = null;
+	const commit = () => {
+		if (current) {
+			current.reply = current.parts.join('\n\n').trim();
+			delete current.parts;
+			turns.push(current);
+		}
+	};
+	for (const line of raw.split(/\r?\n/)) {
+		if (!line) {
+			continue;
+		}
+		let ev;
+		try {
+			ev = JSON.parse(line);
+		} catch (_) {
+			continue; // skip a malformed/partial line
+		}
+		const data = ev && ev.data;
+		if (ev.type === 'user.message') {
+			commit();
+			current = { user: normWhitespace(data && data.content), parts: [], reply: '' };
+		} else if (ev.type === 'assistant.message' && current) {
+			if (data && typeof data.content === 'string' && data.content.trim()) {
+				current.parts.push(data.content.trim());
+			}
+		}
+	}
+	commit();
+	return turns;
+}
+
+/**
+ * Decide whether a journal prompt and a transcript prompt are the same turn.
+ * Short prompts (e.g. "yes, please") must match exactly to avoid collisions;
+ * longer prompts may match by prefix to tolerate wrapping/truncation differences.
+ * @param {string} a
+ * @param {string} b
+ */
+function userTextMatch(a, b) {
+	if (!a || !b) {
+		return false;
+	}
+	if (a === b) {
+		return true;
+	}
+	if (Math.min(a.length, b.length) < 20) {
+		return false;
+	}
+	return a.startsWith(b) || b.startsWith(a);
+}
+
+/**
+ * Index of the first turn in the contiguous run of not-yet-finalized turns at the
+ * very end of the session. VS Code writes results in request order, so this run is
+ * exactly the "unwritten tail" we may need to recover. Interior turns that happen
+ * to lack a `result` are older and already complete in the journal, so they are
+ * deliberately excluded.
+ * @param {any[]} requests journal requests, in order
+ * @returns {number} an index in [0, requests.length]; equal to length when none pending
+ */
+function firstPendingTailIndex(requests) {
+	if (!Array.isArray(requests)) {
+		return 0;
+	}
+	let i = requests.length;
+	while (i > 0 && !(requests[i - 1] && requests[i - 1].result)) {
+		i--;
+	}
+	return i;
+}
+
+/**
+ * Splice transcript replies into journal turns that VS Code has not finalized yet.
+ * Aligns the two sequences from the end (the unwritten turns are always the most
+ * recent ones) so duplicate short prompts still map to the correct reply. Mutates
+ * `requests`, setting `__transcriptReply` on recovered turns. Returns the count.
+ * @param {any[]} requests journal requests, in order
+ * @param {{ user: string, reply: string }[]} turns transcript turns, in order
+ * @returns {number}
+ */
+function backfillFromTranscript(requests, turns) {
+	if (!Array.isArray(requests) || !turns.length) {
+		return 0;
+	}
+	// Only the contiguous trailing run of unwritten turns is eligible for recovery;
+	// bounding the scan there also prevents an old duplicate prompt from matching.
+	const tailStart = firstPendingTailIndex(requests);
+	if (tailStart >= requests.length) {
+		return 0; // nothing pending
+	}
+	let recovered = 0;
+	let ti = turns.length - 1;
+	for (let ji = requests.length - 1; ji >= tailStart; ji--) {
+		const req = requests[ji];
+		const userText = normWhitespace(req && req.message && req.message.text);
+		if (!userText) {
+			continue;
+		}
+		let k = ti;
+		while (k >= 0 && !userTextMatch(turns[k].user, userText)) {
+			k--;
+		}
+		if (k < 0) {
+			continue; // this journal turn is absent from the transcript; keep scanning
+		}
+		if (turns[k].reply && !req.__transcriptReply) {
+			req.__transcriptReply = turns[k].reply;
+			recovered++;
+		}
+		ti = k - 1; // consume this transcript turn and everything after it
+	}
+	return recovered;
+}
+
+/**
+ * A same-text prompt immediately followed by another same-text prompt should only
+ * collapse when the earlier request is the hidden superseded/empty send VS Code
+ * does not show. Two completed identical prompts are legitimate separate turns.
+ * @param {any} request
+ */
+function isSupersededOrEmpty(request) {
+	const modelState = request && request.modelState;
+	if (modelState && modelState.value === 3) {
+		return true;
+	}
+	const response = request && Array.isArray(request.response) ? request.response : [];
+	return !response.some(hasVisibleResponsePart);
+}
+
+/**
+ * @param {any} part
+ */
+function hasVisibleResponsePart(part) {
+	if (!part) {
+		return false;
+	}
+	const kind = part.kind;
+	if (kind === undefined || kind === null) {
+		return typeof part.value === 'string' && part.value.trim().length > 0;
+	}
+	return kind === 'inlineReference'
+		|| kind === 'toolInvocationSerialized'
+		|| kind === 'toolInvocation'
+		|| kind === 'textEditGroup'
+		|| kind === 'notebookEditGroup'
+		|| kind === 'warning';
+}
+
+/**
+ * @param {string} text
+ */
+function isGeneratedAgentContinue(text) {
+	return /^@agent\s+Continue:\s*/i.test(text || '');
+}
+
+// ---------------------------------------------------------------------------
 // Markdown rendering
 // ---------------------------------------------------------------------------
 
 /**
  * @param {any} state
- * @param {{ includeReasoning: boolean }} opts
+ * @param {{ stats?: { pendingTurns: number, recoveredTurns: number } }} opts
  */
 function renderMarkdown(state, opts) {
 	const requests = Array.isArray(state.requests) ? state.requests : [];
 	const responder = state.responderUsername || 'Assistant';
+	// Turns in the contiguous trailing run lack a `result` because VS Code has not
+	// written them yet; only those are treated as pending/recoverable below.
+	const tailStart = firstPendingTailIndex(requests);
+
+	// Reduce the raw journal to the turns VS Code actually shows. The journal keeps
+	// two kinds of hidden artifacts that must be dropped so the export matches the UI:
+	//   1. Interior requests with no `result` are aborted/superseded attempts (the user
+	//      resent, or VS Code cancelled them). The live trailing run is also result-less
+	//      but is kept, since that is the in-progress tail we may backfill.
+	//   2. Internal continuation prompts (`@agent Continue: ...`) are VS Code agent
+	//      control messages, not user-visible chat turns; their assistant response is
+	//      merged into the previous visible turn because VS Code displays it there.
+	//   3. A superseded/empty request immediately followed by another carrying identical
+	//      prompt text is a re-send; only the later (final) one is kept.
+	const visible = [];
+	for (let i = 0; i < requests.length; i++) {
+		const request = requests[i];
+		if (!request) {
+			continue;
+		}
+		const isPendingTail = i >= tailStart;
+		if (!isPendingTail && !request.result) {
+			continue; // interior aborted/superseded attempt — hidden by VS Code
+		}
+		const text = request.message && typeof request.message.text === 'string' ? request.message.text.trim() : '';
+		if (isGeneratedAgentContinue(text)) {
+			const prev = visible.length ? visible[visible.length - 1] : null;
+			if (prev) {
+				if (!Array.isArray(prev.continuations)) {
+					prev.continuations = [];
+				}
+				prev.continuations.push({ request, origIndex: i, text, isPendingTail });
+				prev.isPendingTail = prev.isPendingTail || isPendingTail;
+			}
+			continue;
+		}
+		const prev = visible.length ? visible[visible.length - 1] : null;
+		if (prev && prev.origIndex === i - 1 && text && prev.text === text && !prev.isPendingTail && !isPendingTail && isSupersededOrEmpty(prev.request)) {
+			visible[visible.length - 1] = { request, origIndex: i, text, isPendingTail }; // regeneration wins
+			continue;
+		}
+		visible.push({ request, origIndex: i, text, isPendingTail });
+	}
+
 	const out = [];
 
 	out.push('# ' + sessionTitle(state));
@@ -518,15 +801,15 @@ function renderMarkdown(state, opts) {
 	if (model) {
 		out.push('- **Model:** ' + model);
 	}
-	out.push('- **Messages:** ' + requests.length);
+	out.push('- **Messages:** ' + visible.length);
 	out.push('');
 	out.push('---');
 	out.push('');
 
-	for (const request of requests) {
-		const userText = request && request.message && typeof request.message.text === 'string'
-			? request.message.text.trim()
-			: '';
+	for (const turn of visible) {
+		const request = turn.request;
+		const isPendingTail = turn.isPendingTail;
+		const userText = turn.text;
 		out.push('### User');
 		out.push('');
 		out.push(userText || '_(empty message)_');
@@ -534,24 +817,50 @@ function renderMarkdown(state, opts) {
 
 		out.push('### ' + responder);
 		out.push('');
-		let body = renderResponse(Array.isArray(request.response) ? request.response : [], opts);
+		let body = renderResponse(responsePartsForTurn(turn), opts);
 		if (request && request.result && request.result.errorDetails && request.result.errorDetails.message) {
 			const note = '> [!WARNING] ' + String(request.result.errorDetails.message).replace(/\n/g, ' ');
 			body = body ? body + '\n\n' + note : note;
 		}
-		if (body) {
-			out.push(body);
-		} else if (!(request && request.result)) {
-			// Empty body on a turn that has no `result` yet: VS Code finalizes and
-			// flushes a completed turn to disk lazily, so the most recent reply is
-			// frequently still buffered in memory when an export runs. Flag it so the
-			// caller can advise the user to re-export once the journal catches up.
-			if (opts && opts.stats) {
-				opts.stats.pendingTurns += 1;
-			}
-			out.push('_(response not yet saved to disk \u2014 VS Code writes chat history lazily; wait a few seconds and run the export again to capture it)_');
+		// VS Code writes the chatSessions journal lazily and in request order, so the
+		// trailing run of turns is often unwritten or truncated there. For those we
+		// prefer a reply recovered from the live Copilot transcript (see
+		// backfillFromTranscript), and otherwise flag the turn so a partial or blank
+		// reply is never shown as final. Earlier turns always render from the journal.
+		if (!isPendingTail) {
+			out.push(body || '_(no response captured)_');
 		} else {
-			out.push('_(no response captured)_');
+			// Live tail: VS Code keeps the newest turns in memory and flushes the
+			// session journal lazily, so the on-disk response can be empty or partial
+			// for the last few turns. Prefer whichever source is more complete: the
+			// journal render (rich \u2014 tool calls and edits) or the plain-text
+			// reply recovered from the Copilot transcript. Only the truly in-progress
+			// final turn falls back to a placeholder.
+			const transcriptReply = transcriptReplyForTurn(turn);
+			let chosen = body;
+			let recovered = false;
+			if (transcriptReply && (!body || transcriptReply.length > body.length)) {
+				chosen = transcriptReply;
+				recovered = true;
+			}
+			if (chosen) {
+				out.push(chosen);
+				if (recovered) {
+					out.push('');
+					out.push('> [!NOTE] Recovered from the live chat transcript \u2014 VS Code had not yet written this turn to the session journal.');
+				} else if (turn === visible[visible.length - 1]) {
+					if (opts && opts.stats) {
+						opts.stats.pendingTurns += 1;
+					}
+					out.push('');
+					out.push('> [!WARNING] This reply was still being written when the chat was exported, so it may be incomplete. Re-export once the response has finished.');
+				}
+			} else {
+				if (opts && opts.stats) {
+					opts.stats.pendingTurns += 1;
+				}
+				out.push('_(response not yet captured \u2014 VS Code was still writing this turn; re-export once the reply has finished)_');
+			}
 		}
 		out.push('');
 		out.push('---');
@@ -562,6 +871,43 @@ function renderMarkdown(state, opts) {
 }
 
 /**
+ * @param {{ request: any, continuations?: { request: any }[] }} turn
+ * @returns {any[]}
+ */
+function responsePartsForTurn(turn) {
+	const parts = [];
+	const add = (request) => {
+		if (request && Array.isArray(request.response)) {
+			parts.push(...request.response);
+		}
+	};
+	add(turn && turn.request);
+	for (const continuation of (turn && turn.continuations) || []) {
+		add(continuation && continuation.request);
+	}
+	return parts;
+}
+
+/**
+ * @param {{ request: any, continuations?: { request: any }[] }} turn
+ * @returns {string}
+ */
+function transcriptReplyForTurn(turn) {
+	let best = '';
+	const consider = (request) => {
+		const reply = request && typeof request.__transcriptReply === 'string' ? request.__transcriptReply : '';
+		if (reply.length > best.length) {
+			best = reply;
+		}
+	};
+	consider(turn && turn.request);
+	for (const continuation of (turn && turn.continuations) || []) {
+		consider(continuation && continuation.request);
+	}
+	return best;
+}
+
+/**
  * Render an array of response parts to Markdown.
  *
  * Markdown parts are sometimes serialized as progressive snapshots, where a later
@@ -569,12 +915,42 @@ function renderMarkdown(state, opts) {
  * markdown parts using a prefix test instead of blindly concatenating them.
  *
  * @param {any[]} parts
- * @param {{ includeReasoning: boolean }} opts
+ * @param {any} _opts
  */
-function renderResponse(parts, opts) {
+function renderResponse(parts, _opts) {
+	// VS Code serializes each tool invocation twice: once when the call completes and
+	// again after it generates a short title for it (the second copy carries an extra
+	// `generatedTitle`). Both share the same `toolCallId`, so the journal — and thus a
+	// naive replay — sees every tool block duplicated. Keep only the first occurrence
+	// of each `toolCallId`; genuinely distinct calls (even repeated reads of the same
+	// file) have different ids and are preserved.
+	if (Array.isArray(parts)) {
+		const seenToolCalls = new Set();
+		parts = parts.filter((p) => {
+			if (p && (p.kind === 'toolInvocationSerialized' || p.kind === 'toolInvocation') && p.toolCallId) {
+				if (seenToolCalls.has(p.toolCallId)) {
+					return false;
+				}
+				seenToolCalls.add(p.toolCallId);
+			}
+			return true;
+		});
+	}
+
+	// Agent-mode responses interleave hidden `thinking` parts, normal markdown status
+	// notes ("Let me inspect..."), and operational tool/edit records before the final
+	// answer. The markdown status notes are not tagged as `thinking`, so the useful
+	// boundary is the last operational part before the final visible prose. VS Code can
+	// append trailing status records after prose, and those must not erase the answer.
+	const finalStart = lastOperationalPartIndexBeforeFinalContent(parts) + 1;
+
 	const blocks = [];
 	let mdBuffer = null; // accumulated visible markdown (including inline references)
-	let thinkBuffer = null; // accumulated reasoning text
+	// Raw text of the most recent markdown part. Consecutive markdown parts are
+	// progressive snapshots of one streamed block (each a prefix-superset of the part
+	// just before it); tracking the last one lets us collapse them into the longest
+	// instead of concatenating. Any non-markdown part ends the run and clears this.
+	let lastMd = null;
 
 	const flushMarkdown = () => {
 		if (mdBuffer != null) {
@@ -584,57 +960,149 @@ function renderResponse(parts, opts) {
 			}
 			mdBuffer = null;
 		}
+		lastMd = null;
 	};
-	const flushThinking = () => {
-		if (thinkBuffer != null) {
-			const text = thinkBuffer.trim();
-			if (opts.includeReasoning && text) {
-				blocks.push('<details>\n<summary>Reasoning</summary>\n\n' + text + '\n\n</details>');
-			}
-			thinkBuffer = null;
-		}
-	};
-
-	for (const part of parts) {
+	for (let i = 0; i < parts.length; i++) {
+		const part = parts[i];
 		const kind = part && part.kind;
+		if (i < finalStart || isOperationalResponsePart(part)) {
+			flushMarkdown();
+			continue;
+		}
 
 		if (kind === undefined || kind === null) {
-			// Markdown content.
-			flushThinking();
+			// Markdown content. Collapse against the immediately preceding markdown part
+			// (not the whole buffer, which may already hold earlier text and references)
+			// so progressive snapshots extend in place instead of duplicating.
 			if (typeof part.value === 'string') {
-				mdBuffer = mergeProgressive(mdBuffer, part.value);
+				if (isOperationalFenceWrapper(parts, i)) {
+					flushMarkdown();
+					continue;
+				}
+				const v = part.value;
+				const inRun = lastMd != null && mdBuffer != null && mdBuffer.endsWith(lastMd);
+				if (inRun && v.startsWith(lastMd)) {
+					mdBuffer = mdBuffer.slice(0, mdBuffer.length - lastMd.length) + v; // extend in place
+					lastMd = v;
+				} else if (inRun && lastMd.startsWith(v)) {
+					// An earlier/shorter snapshot of the same block — already represented.
+				} else {
+					mdBuffer = (mdBuffer == null ? '' : mdBuffer) + v;
+					lastMd = v;
+				}
 			}
 		} else if (kind === 'thinking') {
+			// Internal reasoning is not part of the visible chat transcript. Treat it as a
+			// boundary for streamed markdown snapshots, but do not export its contents.
 			flushMarkdown();
-			if (typeof part.value === 'string') {
-				thinkBuffer = mergeProgressive(thinkBuffer, part.value);
-			}
 		} else if (kind === 'inlineReference') {
-			// Inline file/symbol reference — stays inside the markdown flow.
-			flushThinking();
+			// Inline file/symbol reference — stays inside the markdown flow but ends the
+			// current progressive-snapshot run.
 			const name = referenceName(part);
 			mdBuffer = (mdBuffer == null ? '' : mdBuffer) + '`' + name + '`';
-		} else if (kind === 'toolInvocationSerialized' || kind === 'toolInvocation') {
-			flushThinking();
-			flushMarkdown();
-			const message = markdownText(part.invocationMessage) || markdownText(part.pastTenseMessage) || ('Used tool `' + (part.toolId || part.toolSpecificData && part.toolSpecificData.kind || 'tool') + '`');
-			blocks.push('> ' + collapse(message));
-		} else if (kind === 'textEditGroup' || kind === 'notebookEditGroup') {
-			flushThinking();
-			flushMarkdown();
-			blocks.push('> Edited `' + basenameOf(part.uri) + '`');
+			lastMd = null;
 		} else if (kind === 'warning') {
-			flushThinking();
 			flushMarkdown();
 			blocks.push('> [!WARNING] ' + collapse(markdownText(part.content)));
 		}
-		// All other kinds (mcpServersStarting, progressMessage, undoStop, codeblockUri,
-		// prepareToolInvocation, command buttons, etc.) are internal and skipped.
+		// All other kinds are internal or operational and skipped.
 	}
 
-	flushThinking();
 	flushMarkdown();
 	return blocks.join('\n\n').trim();
+}
+
+/**
+ * VS Code wraps hidden edit/codeblock payloads with standalone markdown fences.
+ * Once those operational payloads are removed, the wrapper fences would turn
+ * ordinary prose into a broken code block, so suppress only fence-only chunks
+ * adjacent to operational response parts.
+ * @param {any[]} parts
+ * @param {number} index
+ */
+function isOperationalFenceWrapper(parts, index) {
+	const part = parts[index];
+	if (!isFenceOnlyMarkdownPart(part)) {
+		return false;
+	}
+	return isOperationalResponsePart(parts[index - 1]) || isOperationalResponsePart(parts[index + 1]);
+}
+
+/**
+ * @param {any} part
+ */
+function isFenceOnlyMarkdownPart(part) {
+	if (!part || !(part.kind === undefined || part.kind === null) || typeof part.value !== 'string') {
+		return false;
+	}
+	return /^\s*```[\w-]*\s*$/.test(part.value);
+}
+
+/**
+ * @param {any[]} parts
+ */
+function lastOperationalPartIndexBeforeFinalContent(parts) {
+	if (!Array.isArray(parts)) {
+		return -1;
+	}
+	const finalContentIndex = lastVisibleTranscriptPartIndex(parts);
+	const end = finalContentIndex >= 0 ? finalContentIndex - 1 : parts.length - 1;
+	for (let i = end; i >= 0; i--) {
+		if (isOperationalResponsePart(parts[i])) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+/**
+ * @param {any[]} parts
+ */
+function lastVisibleTranscriptPartIndex(parts) {
+	if (!Array.isArray(parts)) {
+		return -1;
+	}
+	for (let i = parts.length - 1; i >= 0; i--) {
+		if (isVisibleTranscriptPart(parts[i])) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+/**
+ * @param {any} part
+ */
+function isVisibleTranscriptPart(part) {
+	if (!part) {
+		return false;
+	}
+	const kind = part.kind;
+	if (kind === undefined || kind === null) {
+		return typeof part.value === 'string' && part.value.trim().length > 0;
+	}
+	return kind === 'inlineReference' || kind === 'warning';
+}
+
+/**
+ * Tool calls, edit groups, command buttons, and internal progress markers are useful
+ * while the agent is working, but they are not chat transcript content.
+ * @param {any} part
+ */
+function isOperationalResponsePart(part) {
+	if (!part) {
+		return false;
+	}
+	const kind = part.kind;
+	return kind === 'toolInvocationSerialized'
+		|| kind === 'toolInvocation'
+		|| kind === 'textEditGroup'
+		|| kind === 'notebookEditGroup'
+		|| kind === 'progressTaskSerialized'
+		|| kind === 'progressMessage'
+		|| kind === 'mcpServersStarting'
+		|| kind === 'undoStop'
+		|| kind === 'codeblockUri';
 }
 
 /**

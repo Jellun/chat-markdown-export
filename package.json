@@ -2,7 +2,7 @@
   "name": "chat-markdown-export",
   "displayName": "Chat Markdown Export",
   "description": "Export the current VS Code chat session to a Markdown file in your workspace's vschats folder.",
-  "version": "0.5.1",
+  "version": "0.5.7",
   "publisher": "JunYe",
   "author": "Jun Ye",
   "license": "MIT",
@@ -34,11 +34,6 @@
     "configuration": {
       "title": "Chat Markdown Export",
       "properties": {
-        "chatMarkdownExport.includeReasoning": {
-          "type": "boolean",
-          "default": false,
-          "description": "Include the assistant's internal reasoning ('thinking') blocks in the exported Markdown, wrapped in collapsible <details> sections."
-        },
         "chatMarkdownExport.openAfterExport": {
           "type": "boolean",
           "default": true,
