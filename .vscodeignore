@@ -1,0 +1,8 @@
+.vscode/**
+.gitignore
+jsconfig.json
+node_modules/**
+**/*.map
+__*
+*.vsix
+devnotes.txt

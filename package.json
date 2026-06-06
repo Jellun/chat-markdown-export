@@ -1,0 +1,58 @@
+{
+  "name": "chat-markdown-export",
+  "displayName": "Chat Markdown Export",
+  "description": "Export the current VS Code chat session to a Markdown file in your workspace's vschats folder.",
+  "version": "0.5.0",
+  "publisher": "JunYe",
+  "author": "Jun Ye",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Jellun/chat-markdown-export.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Jellun/chat-markdown-export/issues"
+  },
+  "homepage": "https://github.com/Jellun/chat-markdown-export#readme",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "chatMarkdownExport.exportActiveSession",
+        "title": "Export Chat Session as Markdown",
+        "category": "Chat Export"
+      }
+    ],
+    "configuration": {
+      "title": "Chat Markdown Export",
+      "properties": {
+        "chatMarkdownExport.includeReasoning": {
+          "type": "boolean",
+          "default": false,
+          "description": "Include the assistant's internal reasoning ('thinking') blocks in the exported Markdown, wrapped in collapsible <details> sections."
+        },
+        "chatMarkdownExport.openAfterExport": {
+          "type": "boolean",
+          "default": true,
+          "description": "Open the exported Markdown file in the editor after a successful export."
+        },
+        "chatMarkdownExport.overwriteExisting": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true, re-exporting a session overwrites the existing file. When false, a numeric suffix is added to avoid overwriting."
+        }
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.90.0",
+    "@types/node": "^20.x"
+  }
+}
