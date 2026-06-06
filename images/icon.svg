@@ -1,0 +1,22 @@
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="128" y2="128" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2F7BF6"/>
+      <stop offset="1" stop-color="#0BB8D4"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded-square background -->
+  <rect x="0" y="0" width="128" height="128" rx="28" fill="url(#bg)"/>
+
+  <!-- Chat bubble with a tail (white) -->
+  <path d="M28 30 H100 a14 14 0 0 1 14 14 V74 a14 14 0 0 1 -14 14 H58 l-14 16 v-16 H28
+           a14 14 0 0 1 -14 -14 V44 a14 14 0 0 1 14 -14 Z" fill="#FFFFFF"/>
+
+  <!-- Markdown mark: "M" + down arrow (the chevron also reads as export/download) -->
+  <g fill="none" stroke="url(#bg)" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="40,66 40,44 54,58 68,44 68,66"/>
+    <line x1="88" y1="44" x2="88" y2="66"/>
+    <polyline points="79,56 88,66 97,56"/>
+  </g>
+</svg>
