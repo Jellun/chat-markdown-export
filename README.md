@@ -1,8 +1,24 @@
 # Chat Markdown Export
 
-A small VS Code extension that exports your **current chat session** to a Markdown
+A lightweight VS Code extension that exports your **current chat session** to a Markdown
 file saved in a **`vschats` subfolder of the open folder**, named after the session.
 The `vschats` folder is created automatically the first time you export.
+
+## Why export your chats?
+
+Chat Markdown Export is designed for a few everyday VS Code Chat pain points:
+
+- **Searchable history** — VS Code Chat keeps useful conversations, but it does not
+  provide keyword search across your chat history. Exporting sessions to Markdown lets
+  you search them with your editor, source control, or knowledge-base tools.
+- **Project-local records** — Chat sessions are stored outside your workspace folder.
+  If you rename or relocate a project, its chat history can become difficult to find
+  again. Saving Markdown copies under `vschats` keeps important conversations with the
+  project they belong to.
+- **Reusable knowledge** — Some chats capture debugging trails, design decisions,
+  prompts, summaries, explanations, or standout AI-generated answers worth keeping.
+  Export them as individual Markdown files and fold them into your notes or knowledge
+  base for later use.
 
 ## Commands
 
