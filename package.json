@@ -2,7 +2,7 @@
   "name": "chat-markdown-export",
   "displayName": "Chat Markdown Export",
   "description": "Export the current VS Code chat session to a Markdown file in your workspace's vschats folder.",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "publisher": "JunYe",
   "author": "Jun Ye",
   "license": "MIT",
