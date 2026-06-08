@@ -1,5 +1,5 @@
 // Chat Markdown Export
-// Exports the current VS Code chat session to a Markdown file in a "vschats"
+// Exports a chosen VS Code chat session to a Markdown file in a "vschats"
 // subfolder of the workspace root.
 //
 // VS Code does not expose a public API for reading chat session messages, so this

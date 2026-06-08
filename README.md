@@ -1,6 +1,6 @@
 # Chat Markdown Export
 
-A lightweight VS Code extension that exports your **current chat session** to a Markdown
+A lightweight VS Code extension that exports a **selected chat session** to a Markdown
 file saved in a **`vschats` subfolder of the open folder**, named after the session.
 The `vschats` folder is created automatically the first time you export.
 
