@@ -75,7 +75,7 @@ From the VS Code **Extensions** view (`Ctrl+Shift+X`), search for **Chat Markdow
 Export** and click **Install**. Or from a terminal (once published):
 
 ```powershell
-code --install-extension JunYe.chat-markdown-export
+code --install-extension Jun-Ye.chat-markdown-export
 ```
 
 Then open the Command Palette (`Ctrl+Shift+P`) and run **Chat Export: Export Chat
