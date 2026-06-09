@@ -72,7 +72,7 @@ newest session is pre-selected instead. Sessions are always listed newest-first.
 ## Install
 
 From the VS Code **Extensions** view (`Ctrl+Shift+X`), search for **Chat Markdown
-Export** and click **Install**. Or from a terminal (once published):
+Export** and click **Install**. Or from a terminal:
 
 ```powershell
 code --install-extension Jun-Ye.chat-markdown-export
