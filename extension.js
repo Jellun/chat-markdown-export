@@ -106,7 +106,7 @@ async function exportSession(session, workspaceFolder) {
 
 	const config = vscode.workspace.getConfiguration('chatMarkdownExport');
 	const opts = {
-		stats: { pendingTurns: 0, recoveredTurns: 0 },
+		stats: { pendingTurns: 0, recoveredTurns: 0, interruptedTurns: 0 },
 	};
 
 	// VS Code writes the chatSessions journal lazily and in request order, so the
@@ -148,7 +148,8 @@ async function exportSession(session, workspaceFolder) {
 	);
 	const recovered = opts.stats.recoveredTurns;
 	const pending = opts.stats.pendingTurns;
-	if (recovered > 0 || pending > 0) {
+	const interrupted = opts.stats.interruptedTurns;
+	if (recovered > 0 || pending > 0 || interrupted > 0) {
 		const notes = [];
 		if (recovered > 0) {
 			notes.push(
@@ -156,9 +157,15 @@ async function exportSession(session, workspaceFolder) {
 				+ ' from the live chat transcript'
 			);
 		}
+		if (interrupted > 0) {
+			notes.push(
+				interrupted + ' turn' + (interrupted === 1 ? '' : 's') + ' had no recorded reply'
+				+ ' (the request was interrupted or cancelled)'
+			);
+		}
 		if (pending > 0) {
 			notes.push(
-				pending + ' turn' + (pending === 1 ? '' : 's') + ' ' + (pending === 1 ? 'was' : 'were')
+				pending + ' turn' + (pending === 1 ? '' : 's') + ' ' + (pending === 1 ? 'is' : 'are')
 				+ ' still being written and may be blank or incomplete \u2014 re-export once the reply has finished'
 			);
 		}
@@ -730,6 +737,21 @@ function hasVisibleResponsePart(part) {
 }
 
 /**
+ * A trailing turn that has no `result` is either being generated right now or was
+ * abandoned. VS Code records `modelState.value === 0` for a request whose reply was
+ * interrupted/cancelled before the assistant responded — that turn will NEVER gain a
+ * result, so telling the user to "re-export once it finishes" loops forever. An
+ * actively-streaming turn instead carries `modelState.value === 4`. Only value 0 is
+ * the terminal "aborted" state, so we key off it exactly and leave every other state
+ * (4 in-progress, or anything unrecognized) on the existing wait-and-retry path.
+ * @param {any} request
+ */
+function isAbortedUnfinalized(request) {
+	const modelState = request && request.modelState;
+	return !!(modelState && modelState.value === 0);
+}
+
+/**
  * @param {string} text
  */
 function isGeneratedAgentContinue(text) {
@@ -830,12 +852,14 @@ function renderMarkdown(state, opts) {
 		if (!isPendingTail) {
 			out.push(body || '_(no response captured)_');
 		} else {
-			// Live tail: VS Code keeps the newest turns in memory and flushes the
-			// session journal lazily, so the on-disk response can be empty or partial
-			// for the last few turns. Prefer whichever source is more complete: the
-			// journal render (rich \u2014 tool calls and edits) or the plain-text
-			// reply recovered from the Copilot transcript. Only the truly in-progress
-			// final turn falls back to a placeholder.
+			// Unfinalized trailing turn. VS Code writes the journal lazily, so the
+			// newest turns can be empty or partial on disk. Two very different cases
+			// live here and must be told apart, because their advice is opposite:
+			//   * actively generating (modelState.value === 4): the reply is streaming
+			//     right now, so waiting and re-exporting WILL complete it.
+			//   * aborted/abandoned (modelState.value === 0): the assistant reply was
+			//     interrupted or cancelled and will NEVER arrive, so "re-export once it
+			//     finishes" can never be satisfied — that is the stuck-warning bug.
 			const transcriptReply = transcriptReplyForTurn(turn);
 			let chosen = body;
 			let recovered = false;
@@ -843,23 +867,32 @@ function renderMarkdown(state, opts) {
 				chosen = transcriptReply;
 				recovered = true;
 			}
+			const aborted = isAbortedUnfinalized(request);
+			const liveLastTurn = !aborted && turn === visible[visible.length - 1];
 			if (chosen) {
 				out.push(chosen);
 				if (recovered) {
 					out.push('');
 					out.push('> [!NOTE] Recovered from the live chat transcript \u2014 VS Code had not yet written this turn to the session journal.');
-				} else if (turn === visible[visible.length - 1]) {
+				} else if (liveLastTurn) {
 					if (opts && opts.stats) {
 						opts.stats.pendingTurns += 1;
 					}
 					out.push('');
 					out.push('> [!WARNING] This reply was still being written when the chat was exported, so it may be incomplete. Re-export once the response has finished.');
 				}
-			} else {
+				// Otherwise this is partial content from an interrupted turn: show what
+				// was captured as-is, with no "re-export" nag (the reply never finished).
+			} else if (liveLastTurn) {
 				if (opts && opts.stats) {
 					opts.stats.pendingTurns += 1;
 				}
-				out.push('_(response not yet captured \u2014 VS Code was still writing this turn; re-export once the reply has finished)_');
+				out.push('_(response not yet captured \u2014 VS Code is still writing this turn; re-export once the reply has finished)_');
+			} else {
+				if (opts && opts.stats) {
+					opts.stats.interruptedTurns = (opts.stats.interruptedTurns || 0) + 1;
+				}
+				out.push('_(no reply recorded \u2014 this request was interrupted or cancelled before the assistant responded)_');
 			}
 		}
 		out.push('');
