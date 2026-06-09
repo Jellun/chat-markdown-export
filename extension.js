@@ -106,8 +106,17 @@ async function exportSession(session, workspaceFolder) {
 
 	const config = vscode.workspace.getConfiguration('chatMarkdownExport');
 	const opts = {
-		stats: { pendingTurns: 0, recoveredTurns: 0, interruptedTurns: 0 },
+		stats: { pendingTurns: 0, recoveredTurns: 0, interruptedTurns: 0, realignedTurns: 0 },
 	};
+
+	// Before anything reads the reconstructed turns, repair replies VS Code recorded
+	// against the wrong turn after a cancelled/aborted resend (see reflowDisplacedReplies).
+	// Best-effort: any failure leaves the journal data exactly as reconstructed.
+	try {
+		opts.stats.realignedTurns = reflowDisplacedReplies(state);
+	} catch (_) {
+		/* reply realignment is best-effort; fall back to the journal as-is */
+	}
 
 	// VS Code writes the chatSessions journal lazily and in request order, so the
 	// most recent turns of an active session are often missing or truncated there.
@@ -149,8 +158,15 @@ async function exportSession(session, workspaceFolder) {
 	const recovered = opts.stats.recoveredTurns;
 	const pending = opts.stats.pendingTurns;
 	const interrupted = opts.stats.interruptedTurns;
-	if (recovered > 0 || pending > 0 || interrupted > 0) {
+	const realigned = opts.stats.realignedTurns;
+	if (recovered > 0 || pending > 0 || interrupted > 0 || realigned > 0) {
 		const notes = [];
+		if (realigned > 0) {
+			notes.push(
+				'realigned ' + realigned + ' repl' + (realigned === 1 ? 'y' : 'ies')
+				+ ' that VS Code had recorded under the wrong turn'
+			);
+		}
 		if (recovered > 0) {
 			notes.push(
 				'recovered ' + recovered + ' recent turn' + (recovered === 1 ? '' : 's')
@@ -504,6 +520,7 @@ function reconstructSession(file) {
 			} else if (op.kind === 1 && state) {
 				setAtPath(state, op.k, op.v);
 			} else if (op.kind === 2 && state) {
+				tagDisplacedResponseParts(state, op.k, op.v);
 				appendAtPath(state, op.k, op.v);
 			}
 		} catch (_) {
@@ -535,6 +552,44 @@ function appendAtPath(root, keyPath, items) {
 	if (Array.isArray(node) && Array.isArray(items)) {
 		for (const item of items) {
 			node.push(item);
+		}
+	}
+}
+
+/**
+ * Flag response parts that VS Code appended onto the wrong turn. In a healthy session
+ * the assistant's reply streams into the *current* (last) turn and is sealed with a
+ * `result`; no more reply content arrives afterwards. But once a cancelled/aborted
+ * resend shifts VS Code's write index, it keeps appending each later turn's reply onto
+ * an *already-finalized earlier* turn while the genuine later turns stay blank. Such an
+ * append is recognisable at replay time: the target turn already has a `result` and is
+ * no longer the last request. We tag those parts (without moving them yet) so a later
+ * pass can relocate them only when it is safe to do so.
+ * @param {any} state reconstructed session so far
+ * @param {(string|number)[]} keyPath append target path
+ * @param {any[]} items parts being appended
+ */
+function tagDisplacedResponseParts(state, keyPath, items) {
+	if (!Array.isArray(keyPath) || keyPath.length !== 3) {
+		return;
+	}
+	if (keyPath[0] !== 'requests' || keyPath[2] !== 'response') {
+		return;
+	}
+	if (!Array.isArray(items) || !state || !Array.isArray(state.requests)) {
+		return;
+	}
+	const idx = keyPath[1];
+	if (typeof idx !== 'number') {
+		return;
+	}
+	const request = state.requests[idx];
+	if (!request || !request.result || idx >= state.requests.length - 1) {
+		return; // streaming into the live turn, or finalising the last turn: not displaced
+	}
+	for (const part of items) {
+		if (part && typeof part === 'object') {
+			part.__displacedFrom = idx;
 		}
 	}
 }
@@ -758,31 +813,24 @@ function isGeneratedAgentContinue(text) {
 	return /^@agent\s+Continue:\s*/i.test(text || '');
 }
 
-// ---------------------------------------------------------------------------
-// Markdown rendering
-// ---------------------------------------------------------------------------
-
 /**
- * @param {any} state
- * @param {{ stats?: { pendingTurns: number, recoveredTurns: number } }} opts
+ * Reduce the raw journal to the turns VS Code actually shows, dropping hidden
+ * artifacts so the export matches the UI:
+ *   1. Interior requests with no `result` are aborted/superseded attempts (the user
+ *      resent, or VS Code cancelled them). The live trailing run is also result-less
+ *      but is kept, since that is the in-progress tail we may backfill.
+ *   2. Internal continuation prompts (`@agent Continue: ...`) are VS Code agent
+ *      control messages, not user-visible chat turns; their assistant response is
+ *      merged into the previous visible turn because VS Code displays it there.
+ *   3. A superseded/empty request immediately followed by another carrying identical
+ *      prompt text is a re-send; only the later (final) one is kept.
+ * @param {any[]} requests journal requests, in order
+ * @returns {any[]} visible turns: { request, origIndex, text, isPendingTail, continuations? }
  */
-function renderMarkdown(state, opts) {
-	const requests = Array.isArray(state.requests) ? state.requests : [];
-	const responder = state.responderUsername || 'Assistant';
+function buildVisibleTurns(requests) {
 	// Turns in the contiguous trailing run lack a `result` because VS Code has not
 	// written them yet; only those are treated as pending/recoverable below.
 	const tailStart = firstPendingTailIndex(requests);
-
-	// Reduce the raw journal to the turns VS Code actually shows. The journal keeps
-	// two kinds of hidden artifacts that must be dropped so the export matches the UI:
-	//   1. Interior requests with no `result` are aborted/superseded attempts (the user
-	//      resent, or VS Code cancelled them). The live trailing run is also result-less
-	//      but is kept, since that is the in-progress tail we may backfill.
-	//   2. Internal continuation prompts (`@agent Continue: ...`) are VS Code agent
-	//      control messages, not user-visible chat turns; their assistant response is
-	//      merged into the previous visible turn because VS Code displays it there.
-	//   3. A superseded/empty request immediately followed by another carrying identical
-	//      prompt text is a re-send; only the later (final) one is kept.
 	const visible = [];
 	for (let i = 0; i < requests.length; i++) {
 		const request = requests[i];
@@ -812,6 +860,161 @@ function renderMarkdown(state, opts) {
 		}
 		visible.push({ request, origIndex: i, text, isPendingTail });
 	}
+	return visible;
+}
+
+/**
+ * Whether a visible turn already carries a reply of its own — primary (non-displaced)
+ * response content, or a reply recovered from the transcript. Turns that fail this are
+ * the blank slots a displaced reply can be moved back onto.
+ * @param {{ request: any, continuations?: { request: any }[] }} turn
+ * @returns {boolean}
+ */
+function turnHasOwnReply(turn) {
+	const has = (request) => {
+		if (!request) {
+			return false;
+		}
+		if (typeof request.__transcriptReply === 'string' && request.__transcriptReply.trim()) {
+			return true;
+		}
+		const response = Array.isArray(request.response) ? request.response : [];
+		return response.some((p) => p && p.__displacedFrom === undefined && hasVisibleResponsePart(p));
+	};
+	if (has(turn && turn.request)) {
+		return true;
+	}
+	for (const c of (turn && turn.continuations) || []) {
+		if (has(c && c.request)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Repair the rare case where VS Code routed late-finalized replies onto the wrong
+ * turns. After a cancelled/aborted resend, VS Code's journal writer can keep appending
+ * each subsequent reply onto an already-finalized earlier turn (see
+ * tagDisplacedResponseParts), leaving the genuine later turns blank. When the number of
+ * displaced reply blocks exactly equals the number of blank answerable turns, each
+ * block is moved — in order — back onto the turn it belongs to. Anything less certain
+ * is left untouched, so healthy sessions are never altered.
+ * @param {any} state reconstructed session (mutated in place)
+ * @returns {number} number of replies relocated
+ */
+function reflowDisplacedReplies(state) {
+	const requests = state && Array.isArray(state.requests) ? state.requests : null;
+	if (!requests) {
+		return 0;
+	}
+	// Group displaced parts by the (wrong) turn they were appended to, in turn order.
+	const blocks = [];
+	const byIndex = new Map();
+	for (let i = 0; i < requests.length; i++) {
+		const response = requests[i] && requests[i].response;
+		if (!Array.isArray(response)) {
+			continue;
+		}
+		for (const part of response) {
+			if (part && part.__displacedFrom === i) {
+				let block = byIndex.get(i);
+				if (!block) {
+					block = { sourceIndex: i, parts: [], hasMd: false };
+					byIndex.set(i, block);
+					blocks.push(block);
+				}
+				block.parts.push(part);
+				if ((part.kind === undefined || part.kind === null) && typeof part.value === 'string' && part.value.trim()) {
+					block.hasMd = true;
+				}
+			}
+		}
+	}
+	// Only blocks that carry visible markdown are genuine relocated answers.
+	const answerBlocks = blocks.filter((b) => b.hasMd);
+	if (!answerBlocks.length) {
+		return 0;
+	}
+
+	// Blank answerable turns, in display order, that have no reply of their own.
+	const visible = buildVisibleTurns(requests);
+	const lastVisible = visible.length ? visible[visible.length - 1] : null;
+	const holes = [];
+	for (const turn of visible) {
+		const request = turn.request;
+		// Canceled turns intentionally have no reply (they render a Canceled marker).
+		if (request && request.result && request.result.errorDetails && request.result.errorDetails.message) {
+			continue;
+		}
+		// The actively-streaming last turn is not a hole; it is still being written.
+		if (turn === lastVisible && turn.isPendingTail && !isAbortedUnfinalized(request)) {
+			continue;
+		}
+		if (turnHasOwnReply(turn)) {
+			continue;
+		}
+		holes.push(turn);
+	}
+
+	// Only act when the two sequences line up one-to-one; otherwise stay out of the way.
+	if (!holes.length || holes.length !== answerBlocks.length) {
+		return 0;
+	}
+
+	// Both sequences are in ascending turn order. A genuine desync always recorded a
+	// reply EARLIER than the turn it belongs to, so every block must map to a turn at or
+	// after its source. A block that maps to its own turn is a harmless late flush (the
+	// turn's real reply, just written after a later turn was created); a block that maps
+	// to an EARLIER turn is not this pattern at all, so we bail rather than guess.
+	let genuine = 0;
+	for (let i = 0; i < holes.length; i++) {
+		if (holes[i].origIndex < answerBlocks[i].sourceIndex) {
+			return 0;
+		}
+		if (holes[i].origIndex !== answerBlocks[i].sourceIndex) {
+			genuine++;
+		}
+	}
+	if (genuine === 0) {
+		return 0; // every block already sits on its own turn: nothing to relocate
+	}
+
+	// Detach every displaced part from its wrong turn first, then re-home the blocks, so
+	// a turn that is both a source and a destination is handled cleanly.
+	for (let i = 0; i < requests.length; i++) {
+		const request = requests[i];
+		if (request && Array.isArray(request.response)) {
+			request.response = request.response.filter((p) => !(p && p.__displacedFrom === i));
+		}
+	}
+	for (let i = 0; i < holes.length; i++) {
+		const request = holes[i].request;
+		if (!Array.isArray(request.response)) {
+			request.response = [];
+		}
+		for (const part of answerBlocks[i].parts) {
+			if (part && typeof part === 'object') {
+				delete part.__displacedFrom;
+			}
+			request.response.push(part);
+		}
+	}
+	return genuine;
+}
+
+// ---------------------------------------------------------------------------
+// Markdown rendering
+// ---------------------------------------------------------------------------
+
+/**
+ * @param {any} state
+ * @param {{ stats?: { pendingTurns: number, recoveredTurns: number } }} opts
+ */
+function renderMarkdown(state, opts) {
+	const requests = Array.isArray(state.requests) ? state.requests : [];
+	const responder = state.responderUsername || 'Assistant';
+	const visible = buildVisibleTurns(requests);
 
 	const out = [];
 

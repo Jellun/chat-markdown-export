@@ -95,7 +95,7 @@ want to hack on it:
   npm install -g @vscode/vsce
   cd chat-markdown-export
   vsce package
-  code --install-extension chat-markdown-export-0.5.9.vsix
+  code --install-extension chat-markdown-export-0.5.10.vsix
   ```
 
 ## Notes & limitations
@@ -115,6 +115,13 @@ want to hack on it:
   request is superseded or empty, de-duplicates the repeated tool calls (by their call
   id) and progressive markdown snapshots, and otherwise preserves every distinct turn
   in its original order.
+- **Replies recorded against the wrong turn are realigned.** Rarely — typically after you
+  cancel and re-send a prompt while a reply is generating — VS Code's journal routes each
+  later reply onto an already-finished *earlier* turn, leaving the genuine later turns
+  blank. When the exporter can pair the misplaced replies with the blank turns one-for-one
+  and in order, it moves each reply back to the turn it belongs to; the notification then
+  reports how many were realigned. If the pattern is at all ambiguous it leaves the turns
+  untouched, so healthy sessions are never altered.
 - **The most recent turns may export incomplete.** VS Code writes the chat **journal**
   to disk **lazily and in request order**, so during a long, active session the last few
   turns are often still buffered — a reply can be missing or truncated. To close that
