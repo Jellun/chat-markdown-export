@@ -95,26 +95,26 @@ want to hack on it:
   npm install -g @vscode/vsce
   cd chat-markdown-export
   vsce package
-  code --install-extension chat-markdown-export-0.5.11.vsix
+  code --install-extension chat-markdown-export-0.5.16.vsix
   ```
 
 ## Notes & limitations
 
 - The on-disk session format is internal to VS Code and may change between versions;
   the parser is defensive and skips parts it doesn't recognize.
-- Plain prose, code blocks, and inline file references from the assistant's final
-  answer are exported. Internal reasoning/thinking blocks, tool calls, edit records,
-  command/status updates, and agent progress notes are omitted.
+- Plain prose, code blocks, and inline file references from visible assistant replies
+  are exported. Internal reasoning/thinking blocks, tool calls, edit records, and
+  operational status records are omitted.
 - **The export mirrors what VS Code shows, not the raw on-disk log.** VS Code's
   append-only journal keeps artifacts its UI hides: aborted or superseded attempts (left
   behind when you cancel or re-send a prompt) and tool calls that are serialized twice
   (once on completion, then again once a short title is generated). The exporter drops
-  interior aborted attempts, hides generated `@agent Continue` control prompts while
-  merging their assistant output into the previous visible user turn,
-  collapses an identical re-sent prompt into its final answer only when the earlier
-  request is superseded or empty, de-duplicates the repeated tool calls (by their call
-  id) and progressive markdown snapshots, and otherwise preserves every distinct turn
-  in its original order.
+  interior aborted attempts, keeps generated `@agent Continue` turns in the order
+  VS Code's own JSON export shows them, collapses an identical or refined re-sent
+  prompt only when the earlier request is superseded/empty, re-homes continuation and
+  displaced answer blocks when the journal attached them to a neighboring request,
+  de-duplicates the repeated tool calls (by their call id) and progressive markdown
+  snapshots, and otherwise preserves every distinct turn in its original order.
 - **Replies recorded against the wrong turn are realigned.** Rarely — typically after you
   cancel and re-send a prompt while a reply is generating — VS Code's journal routes each
   later reply onto an already-finished *earlier* turn, leaving the genuine later turns

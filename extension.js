@@ -109,14 +109,7 @@ async function exportSession(session, workspaceFolder) {
 		stats: { pendingTurns: 0, recoveredTurns: 0, interruptedTurns: 0, realignedTurns: 0 },
 	};
 
-	// Before anything reads the reconstructed turns, repair replies VS Code recorded
-	// against the wrong turn after a cancelled/aborted resend (see reflowDisplacedReplies).
-	// Best-effort: any failure leaves the journal data exactly as reconstructed.
-	try {
-		opts.stats.realignedTurns = reflowDisplacedReplies(state);
-	} catch (_) {
-		/* reply realignment is best-effort; fall back to the journal as-is */
-	}
+	repairSessionForDisplay(state, opts.stats);
 
 	// VS Code writes the chatSessions journal lazily and in request order, so the
 	// most recent turns of an active session are often missing or truncated there.
@@ -275,7 +268,10 @@ async function pickSession(sessions, activeId) {
 	const items = ordered.map((session, index) => {
 		const state = reconstructSession(session.file);
 		const title = state ? sessionTitle(state) : session.id;
-		const count = state && Array.isArray(state.requests) ? state.requests.length : 0;
+		if (state) {
+			repairSessionForDisplay(state);
+		}
+		const count = state && Array.isArray(state.requests) ? buildVisibleTurns(state.requests).length : 0;
 		const isActive = activeId && session.id === activeId;
 		const isNewest = index === 0 && !activeId;
 		const marker = isActive ? '$(check) ' : isNewest ? '$(circle-filled) ' : '';
@@ -297,6 +293,29 @@ async function pickSession(sessions, activeId) {
 		matchOnDetail: true,
 	});
 	return choice && choice.session;
+}
+
+/**
+ * Apply the same best-effort display repairs used by the Markdown export before
+ * anything counts or renders visible turns.
+ * @param {any} state reconstructed session (mutated in place)
+ * @param {{ realignedTurns?: number }} [stats]
+ */
+function repairSessionForDisplay(state, stats) {
+	// Before anything reads the reconstructed turns, first put generated continuation
+	// replies where VS Code's own JSON export displays them, then repair replies VS Code
+	// recorded against the wrong turn after a cancelled/aborted resend.
+	// Best-effort: any failure leaves the journal data exactly as reconstructed.
+	try {
+		rehomeActiveRefinedReplies(state);
+		rehomeGeneratedContinueReplies(state);
+		const realignedTurns = reflowDisplacedReplies(state);
+		if (stats) {
+			stats.realignedTurns = realignedTurns;
+		}
+	} catch (_) {
+		/* reply realignment is best-effort; fall back to the journal as-is */
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -792,6 +811,184 @@ function hasVisibleResponsePart(part) {
 }
 
 /**
+ * Whether a response has content the Markdown exporter can show directly. This is
+ * narrower than hasVisibleResponsePart: operational tool/edit records are visible
+ * in VS Code while work is happening, but they are not exported as chat prose.
+ * @param {any} request
+ */
+function hasExportableResponseContent(request) {
+	const response = request && Array.isArray(request.response) ? request.response : [];
+	return response.some((part) => {
+		if (!part) {
+			return false;
+		}
+		const kind = part.kind;
+		if (kind === undefined || kind === null) {
+			return typeof part.value === 'string' && part.value.trim().length > 0;
+		}
+		return kind === 'inlineReference' || kind === 'warning';
+	});
+}
+
+/**
+ * @param {any} request
+ * @returns {any[]}
+ */
+function primaryResponseParts(request) {
+	const response = request && Array.isArray(request.response) ? request.response : [];
+	return response.filter((part) => !(part && part.__displacedFrom !== undefined));
+}
+
+/**
+ * @param {any} request
+ * @returns {string}
+ */
+function primaryResponseBody(request) {
+	return renderFinalResponse(primaryResponseParts(request));
+}
+
+/**
+ * @param {any[]} parts
+ * @returns {any[]}
+ */
+function finalResponseParts(parts) {
+	if (!Array.isArray(parts)) {
+		return [];
+	}
+	const finalStart = lastOperationalPartIndexBeforeFinalContent(parts) + 1;
+	return parts.slice(finalStart);
+}
+
+/**
+ * Render only the final visible prose block. Used for classification/reflow only;
+ * the exported Markdown uses renderResponse so it preserves all visible fragments.
+ * @param {any[]} parts
+ * @returns {string}
+ */
+function renderFinalResponse(parts) {
+	return renderResponse(finalResponseParts(parts), {});
+}
+
+/**
+ * @param {string} value
+ * @returns {string[]}
+ */
+function promptTokens(value) {
+	const tokens = String(value || '').toLowerCase().match(/[\p{L}\p{N}]+/gu);
+	return tokens || [];
+}
+
+/**
+ * True when `nextText` is a refined resend of `prevText`, not a separate prompt.
+ * The containment test catches same prompt + extra details while avoiding broad
+ * prefix collapse for unrelated long prompts.
+ * @param {string} prevText
+ * @param {string} nextText
+ */
+function promptRefinesPrevious(prevText, nextText) {
+	const prev = promptTokens(prevText);
+	const next = promptTokens(nextText);
+	if (prev.length < 12 || next.length < 12) {
+		return false;
+	}
+	const prevSet = new Set(prev);
+	const nextSet = new Set(next);
+	let overlap = 0;
+	for (const token of prevSet) {
+		if (nextSet.has(token)) {
+			overlap++;
+		}
+	}
+	const containment = overlap / Math.min(prevSet.size, nextSet.size);
+	return containment >= 0.92;
+}
+
+/**
+ * @param {{ request: any, origIndex: number, text: string, isPendingTail: boolean }} prev
+ * @param {any} request
+ * @param {string} text
+ * @param {boolean} isPendingTail
+ */
+function shouldReplacePreviousTurn(prev, request, text, isPendingTail) {
+	if (!prev || prev.isPendingTail || isPendingTail || !text) {
+		return false;
+	}
+	const prevRequest = prev.request;
+	if (prevRequest && prevRequest.result && prevRequest.result.errorDetails && prevRequest.result.errorDetails.message) {
+		return false; // keep explicit canceled turns visible
+	}
+	if (prev.text === text && isSupersededOrEmpty(prevRequest)) {
+		return true;
+	}
+	if (!promptRefinesPrevious(prev.text, text)) {
+		return false;
+	}
+	return !prevRequest || !prevRequest.result || !primaryResponseBody(prevRequest) || isSupersededOrEmpty(prevRequest);
+}
+
+/**
+ * VS Code can keep the later/refined request id while displaying the response that
+ * streamed under the earlier in-progress request. Preserve that display response
+ * without overwriting the later request's own response, because a following
+ * `@agent Continue` may still need to receive it.
+ * @param {any} state reconstructed session (mutated in place)
+ * @returns {number}
+ */
+function rehomeActiveRefinedReplies(state) {
+	const requests = state && Array.isArray(state.requests) ? state.requests : null;
+	if (!requests) {
+		return 0;
+	}
+	let moved = 0;
+	for (let i = 1; i < requests.length; i++) {
+		const previous = requests[i - 1];
+		const request = requests[i];
+		const previousState = previous && previous.modelState ? previous.modelState.value : undefined;
+		if (previousState !== 4) {
+			continue;
+		}
+		const previousText = previous && previous.message && typeof previous.message.text === 'string' ? previous.message.text.trim() : '';
+		const text = request && request.message && typeof request.message.text === 'string' ? request.message.text.trim() : '';
+		if (!promptRefinesPrevious(previousText, text)) {
+			continue;
+		}
+		const previousResponse = displayResponsePartsForActiveRefinement(previous);
+		if (!previousResponse.length) {
+			continue;
+		}
+		request.__displayResponseParts = previousResponse;
+		previous.__hideFromVisible = true;
+		moved++;
+	}
+	return moved;
+}
+
+/**
+ * A refined prompt may keep the previous request's streamed response as its display
+ * body. Keep that response plus the first late status prefix, but stop when the raw
+ * journal starts replaying content that is already present in the display body.
+ * @param {any} request
+ * @returns {any[]}
+ */
+function displayResponsePartsForActiveRefinement(request) {
+	const response = request && Array.isArray(request.response) ? request.response : [];
+	const parts = [];
+	let rendered = '';
+	for (const part of response) {
+		const isDisplaced = part && part.__displacedFrom !== undefined;
+		const visible = renderResponse([part], {});
+		if (isDisplaced && visible && visible.length >= 40 && textContainsNormalized(rendered, visible)) {
+			break;
+		}
+		parts.push(part);
+		if (visible) {
+			rendered = renderResponse(parts, {});
+		}
+	}
+	return parts;
+}
+
+/**
  * A trailing turn that has no `result` is either being generated right now or was
  * abandoned. VS Code records `modelState.value === 0` for a request whose reply was
  * interrupted/cancelled before the assistant responded — that turn will NEVER gain a
@@ -816,9 +1013,11 @@ function isGeneratedAgentContinue(text) {
 /**
  * Reduce the raw journal to the turns VS Code actually shows, dropping hidden
  * artifacts so the export matches the UI:
- *   1. Interior requests with no `result` are aborted/superseded attempts (the user
- *      resent, or VS Code cancelled them). The live trailing run is also result-less
- *      but is kept, since that is the in-progress tail we may backfill.
+ *   1. Interior requests with no `result` are usually aborted/superseded attempts
+ *      (the user resent, or VS Code cancelled them). Keep them only when they carry
+ *      exportable response text, because VS Code can show those in chat history even
+ *      without a final result marker. The live trailing run is also result-less but
+ *      is kept, since that is the in-progress tail we may backfill.
  *   2. Internal continuation prompts (`@agent Continue: ...`) are VS Code agent
  *      control messages, not user-visible chat turns; their assistant response is
  *      merged into the previous visible turn because VS Code displays it there.
@@ -837,24 +1036,16 @@ function buildVisibleTurns(requests) {
 		if (!request) {
 			continue;
 		}
+		if (request.__hideFromVisible) {
+			continue;
+		}
 		const isPendingTail = i >= tailStart;
-		if (!isPendingTail && !request.result) {
+		if (!isPendingTail && !request.result && (isSupersededOrEmpty(request) || !hasExportableResponseContent(request))) {
 			continue; // interior aborted/superseded attempt — hidden by VS Code
 		}
 		const text = request.message && typeof request.message.text === 'string' ? request.message.text.trim() : '';
-		if (isGeneratedAgentContinue(text)) {
-			const prev = visible.length ? visible[visible.length - 1] : null;
-			if (prev) {
-				if (!Array.isArray(prev.continuations)) {
-					prev.continuations = [];
-				}
-				prev.continuations.push({ request, origIndex: i, text, isPendingTail });
-				prev.isPendingTail = prev.isPendingTail || isPendingTail;
-			}
-			continue;
-		}
 		const prev = visible.length ? visible[visible.length - 1] : null;
-		if (prev && prev.origIndex === i - 1 && text && prev.text === text && !prev.isPendingTail && !isPendingTail && isSupersededOrEmpty(prev.request)) {
+		if (prev && prev.origIndex === i - 1 && shouldReplacePreviousTurn(prev, request, text, isPendingTail)) {
 			visible[visible.length - 1] = { request, origIndex: i, text, isPendingTail }; // regeneration wins
 			continue;
 		}
@@ -878,7 +1069,7 @@ function turnHasOwnReply(turn) {
 		if (typeof request.__transcriptReply === 'string' && request.__transcriptReply.trim()) {
 			return true;
 		}
-		const response = Array.isArray(request.response) ? request.response : [];
+		const response = responsePartsForRequest(request);
 		return response.some((p) => p && p.__displacedFrom === undefined && hasVisibleResponsePart(p));
 	};
 	if (has(turn && turn.request)) {
@@ -890,6 +1081,94 @@ function turnHasOwnReply(turn) {
 		}
 	}
 	return false;
+}
+
+/**
+ * VS Code's built-in chat JSON export keeps generated `@agent Continue` prompts as
+ * visible user turns. In the journal, the final answer for that continue can remain
+ * attached to the immediately preceding user request, while the continue request
+ * later receives displaced content for a following turn. Move the previous answer
+ * onto the continue request so the display order matches VS Code's export model.
+ * @param {any} state reconstructed session (mutated in place)
+ * @returns {number}
+ */
+function rehomeGeneratedContinueReplies(state) {
+	const requests = state && Array.isArray(state.requests) ? state.requests : null;
+	if (!requests) {
+		return 0;
+	}
+	let moved = 0;
+	for (let i = 1; i < requests.length; i++) {
+		const request = requests[i];
+		const text = request && request.message && typeof request.message.text === 'string' ? request.message.text.trim() : '';
+		if (!isGeneratedAgentContinue(text)) {
+			continue;
+		}
+		const previous = requests[i - 1];
+		const previousResponse = previous && Array.isArray(previous.response) ? previous.response : [];
+		if (!previousResponse.length || !renderResponse(previousResponse, {})) {
+			continue;
+		}
+		const currentResponse = Array.isArray(request.response) ? request.response : [];
+		const currentPrefix = leadingPrimaryResponsePartsForContinue(request);
+		const displaced = currentResponse.filter((part) => part && part.__displacedFrom !== undefined);
+		for (const part of previousResponse) {
+			if (part && typeof part === 'object') {
+				delete part.__displacedFrom;
+			}
+		}
+		request.response = currentPrefix.concat(previousResponse, displaced);
+		previous.response = [];
+		previous.__responseMovedToContinue = true;
+		moved++;
+	}
+	return moved;
+}
+
+/**
+ * Generated continue turns can have a small status prefix of their own before VS Code
+ * displays the previous request's final text under the continue id. Stop that prefix
+ * once a mutating tool has completed and the next visible prose begins.
+ * @param {any} request
+ * @returns {any[]}
+ */
+function leadingPrimaryResponsePartsForContinue(request) {
+	const response = request && Array.isArray(request.response) ? request.response : [];
+	const parts = [];
+	let sawVisible = false;
+	let sawCompletionBoundary = false;
+	for (const part of response) {
+		if (part && part.__displacedFrom !== undefined) {
+			break;
+		}
+		const visible = renderResponse([part], {});
+		if (visible && sawVisible && sawCompletionBoundary) {
+			break;
+		}
+		parts.push(part);
+		if (visible) {
+			sawVisible = true;
+		}
+		if (isMutatingToolInvocation(part)) {
+			sawCompletionBoundary = true;
+		}
+	}
+	return parts;
+}
+
+/**
+ * @param {any} part
+ */
+function isMutatingToolInvocation(part) {
+	if (!part || !(part.kind === 'toolInvocationSerialized' || part.kind === 'toolInvocation')) {
+		return false;
+	}
+	const id = String(part.toolId || '');
+	return id === 'copilot_replaceString'
+		|| id === 'copilot_insertEditIntoFile'
+		|| id === 'copilot_createFile'
+		|| id === 'copilot_createFileAtLocation'
+		|| id === 'copilot_editFile';
 }
 
 /**
@@ -931,8 +1210,12 @@ function reflowDisplacedReplies(state) {
 			}
 		}
 	}
-	// Only blocks that carry visible markdown are genuine relocated answers.
-	const answerBlocks = blocks.filter((b) => b.hasMd);
+	for (const block of blocks) {
+		block.body = renderFinalResponse(block.parts);
+		block.fullBody = renderResponse(block.parts, {});
+	}
+	// Only blocks that render to visible prose are genuine relocated answers.
+	const answerBlocks = blocks.filter((b) => b.body && !/^\s*```[\w-]*\s*$/.test(b.body));
 	if (!answerBlocks.length) {
 		return 0;
 	}
@@ -947,11 +1230,14 @@ function reflowDisplacedReplies(state) {
 		if (request && request.result && request.result.errorDetails && request.result.errorDetails.message) {
 			continue;
 		}
+		if (request && request.__responseMovedToContinue) {
+			continue;
+		}
 		// The actively-streaming last turn is not a hole; it is still being written.
 		if (turn === lastVisible && turn.isPendingTail && !isAbortedUnfinalized(request)) {
 			continue;
 		}
-		if (turnHasOwnReply(turn)) {
+		if (request && request.result && turnHasOwnReply(turn)) {
 			continue;
 		}
 		holes.push(turn);
@@ -980,6 +1266,12 @@ function reflowDisplacedReplies(state) {
 		return 0; // every block already sits on its own turn: nothing to relocate
 	}
 
+	for (let i = 0; i < holes.length; i++) {
+		const currentBody = renderResponseForTurn(holes[i], {});
+		answerBlocks[i].alreadyPresent = textContainsNormalized(currentBody, answerBlocks[i].fullBody);
+		answerBlocks[i].mergedBody = answerBlocks[i].alreadyPresent ? '' : mergeOverlappingText(currentBody, answerBlocks[i].fullBody);
+	}
+
 	// Detach every displaced part from its wrong turn first, then re-home the blocks, so
 	// a turn that is both a source and a destination is handled cleanly.
 	for (let i = 0; i < requests.length; i++) {
@@ -989,8 +1281,17 @@ function reflowDisplacedReplies(state) {
 		}
 	}
 	for (let i = 0; i < holes.length; i++) {
+		if (answerBlocks[i].alreadyPresent) {
+			continue;
+		}
 		const request = holes[i].request;
-		if (!Array.isArray(request.response)) {
+		if (answerBlocks[i].mergedBody) {
+			request.response = [{ value: answerBlocks[i].mergedBody }];
+			continue;
+		}
+		if (!request.result) {
+			request.response = [];
+		} else if (!Array.isArray(request.response)) {
 			request.response = [];
 		}
 		for (const part of answerBlocks[i].parts) {
@@ -1001,6 +1302,41 @@ function reflowDisplacedReplies(state) {
 		}
 	}
 	return genuine;
+}
+
+/**
+ * @param {string} haystack
+ * @param {string} needle
+ */
+function textContainsNormalized(haystack, needle) {
+	const h = String(haystack || '').replace(/\s+/g, ' ').trim();
+	const n = String(needle || '').replace(/\s+/g, ' ').trim();
+	return !!n && h.includes(n);
+}
+
+/**
+ * @param {string} first
+ * @param {string} second
+ */
+function mergeOverlappingText(first, second) {
+	const a = String(first || '').trim();
+	const b = String(second || '').trim();
+	if (!a) {
+		return b;
+	}
+	if (!b || a.includes(b)) {
+		return a;
+	}
+	if (b.includes(a)) {
+		return b;
+	}
+	const max = Math.min(a.length, b.length);
+	for (let len = max; len >= 40; len--) {
+		if (a.endsWith(b.slice(0, len))) {
+			return (a + b.slice(len)).trim();
+		}
+	}
+	return '';
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,7 +1378,7 @@ function renderMarkdown(state, opts) {
 
 		out.push('### ' + responder);
 		out.push('');
-		let body = renderResponse(responsePartsForTurn(turn), opts);
+		let body = renderResponseForTurn(turn, opts);
 		if (request && request.result && request.result.errorDetails && request.result.errorDetails.message) {
 			const note = '> [!WARNING] ' + String(request.result.errorDetails.message).replace(/\n/g, ' ');
 			body = body ? body + '\n\n' + note : note;
@@ -1107,21 +1443,53 @@ function renderMarkdown(state, opts) {
 }
 
 /**
+ * @param {any} request
+ * @returns {any[]}
+ */
+function responsePartsForRequest(request) {
+	if (request && Array.isArray(request.__displayResponseParts)) {
+		return request.__displayResponseParts;
+	}
+	return request && Array.isArray(request.response) ? request.response : [];
+}
+
+/**
  * @param {{ request: any, continuations?: { request: any }[] }} turn
  * @returns {any[]}
  */
 function responsePartsForTurn(turn) {
 	const parts = [];
 	const add = (request) => {
-		if (request && Array.isArray(request.response)) {
-			parts.push(...request.response);
-		}
+		parts.push(...responsePartsForRequest(request));
 	};
 	add(turn && turn.request);
 	for (const continuation of (turn && turn.continuations) || []) {
 		add(continuation && continuation.request);
 	}
 	return parts;
+}
+
+/**
+ * Render the main request and each generated continuation independently, then join
+ * the visible chunks. Running one combined response through renderResponse lets a
+ * later continuation's tool/edit records hide prose from the earlier request.
+ * @param {{ request: any, continuations?: { request: any }[] }} turn
+ * @param {any} opts
+ * @returns {string}
+ */
+function renderResponseForTurn(turn, opts) {
+	const blocks = [];
+	const add = (request) => {
+		const body = renderResponse(responsePartsForRequest(request), opts);
+		if (body) {
+			blocks.push(body);
+		}
+	};
+	add(turn && turn.request);
+	for (const continuation of (turn && turn.continuations) || []) {
+		add(continuation && continuation.request);
+	}
+	return blocks.join('\n\n').trim();
 }
 
 /**
@@ -1173,13 +1541,6 @@ function renderResponse(parts, _opts) {
 		});
 	}
 
-	// Agent-mode responses interleave hidden `thinking` parts, normal markdown status
-	// notes ("Let me inspect..."), and operational tool/edit records before the final
-	// answer. The markdown status notes are not tagged as `thinking`, so the useful
-	// boundary is the last operational part before the final visible prose. VS Code can
-	// append trailing status records after prose, and those must not erase the answer.
-	const finalStart = lastOperationalPartIndexBeforeFinalContent(parts) + 1;
-
 	const blocks = [];
 	let mdBuffer = null; // accumulated visible markdown (including inline references)
 	// Raw text of the most recent markdown part. Consecutive markdown parts are
@@ -1201,7 +1562,7 @@ function renderResponse(parts, _opts) {
 	for (let i = 0; i < parts.length; i++) {
 		const part = parts[i];
 		const kind = part && part.kind;
-		if (i < finalStart || isOperationalResponsePart(part)) {
+		if (isOperationalResponsePart(part)) {
 			flushMarkdown();
 			continue;
 		}
@@ -1271,7 +1632,7 @@ function isFenceOnlyMarkdownPart(part) {
 	if (!part || !(part.kind === undefined || part.kind === null) || typeof part.value !== 'string') {
 		return false;
 	}
-	return /^\s*```[\w-]*\s*$/.test(part.value);
+	return /^\s*(?:```[\w-]*\s*)+$/.test(part.value);
 }
 
 /**
