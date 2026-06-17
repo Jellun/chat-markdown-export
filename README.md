@@ -4,6 +4,9 @@ A lightweight VS Code extension that exports a **selected chat session** to a Ma
 file saved in a **`vschats` subfolder of the open folder**, named after the session.
 The `vschats` folder is created automatically the first time you export.
 
+This extension currently supports VS Code on Windows only. macOS support is coming
+very soon.
+
 ## Why export your chats?
 
 Chat Markdown Export is designed for a few everyday VS Code Chat pain points:
@@ -95,7 +98,7 @@ want to hack on it:
   npm install -g @vscode/vsce
   cd chat-markdown-export
   vsce package
-  code --install-extension chat-markdown-export-0.5.16.vsix
+  code --install-extension chat-markdown-export-0.5.17.vsix
   ```
 
 ## Notes & limitations
