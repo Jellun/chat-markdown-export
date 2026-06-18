@@ -1730,12 +1730,19 @@ function sessionTitle(state) {
 	}
 	const requests = state && Array.isArray(state.requests) ? state.requests : [];
 	if (requests.length && requests[0].message && typeof requests[0].message.text === 'string') {
-		const firstLine = requests[0].message.text.split(/\r?\n/)[0].trim();
+		const firstLine = fallbackTitleText(requests[0].message.text);
 		if (firstLine) {
-			return firstLine.length > 60 ? firstLine.slice(0, 60).trim() + '…' : firstLine;
+			return firstLine.length > 60 ? firstLine.slice(0, 60).trim() : firstLine;
 		}
 	}
 	return (state && state.sessionId) || 'chat-session';
+}
+
+function fallbackTitleText(text) {
+	return String(text || '')
+		.split(/\r?\n/)[0]
+		.replace(/^[^\p{L}\p{N}]+/u, '')
+		.trim();
 }
 
 function modelName(state) {
@@ -1802,6 +1809,8 @@ function sanitizeFileName(name) {
 	let safe = String(name || 'chat-session')
 		.replace(/[\\/:*?"<>|\u0000-\u001F]/g, '-')
 		.replace(/\s+/g, ' ')
+		.trim()
+		.replace(/^[^\p{L}\p{N}]+/u, '')
 		.trim()
 		.replace(/[.\s]+$/, ''); // Windows: no trailing dot/space
 	if (!safe) {
