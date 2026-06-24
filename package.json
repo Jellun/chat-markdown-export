@@ -2,7 +2,7 @@
   "name": "chat-markdown-export",
   "displayName": "Chat Markdown Export",
   "description": "Export a selected VS Code chat session to a Markdown file in your workspace's vschats folder. This extension currently supports VS Code on Windows only. macOS support is coming very soon.",
-  "version": "0.5.18",
+  "version": "0.5.19",
   "publisher": "Jun-Ye",
   "author": "Jun Ye",
   "license": "MIT",

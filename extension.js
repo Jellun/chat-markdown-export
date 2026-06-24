@@ -309,7 +309,8 @@ function repairSessionForDisplay(state, stats) {
 	try {
 		rehomeActiveRefinedReplies(state);
 		rehomeGeneratedContinueReplies(state);
-		const realignedTurns = reflowDisplacedReplies(state);
+		let realignedTurns = repairDuplicatePromptShiftedContinuations(state);
+		realignedTurns += reflowDisplacedReplies(state);
 		if (stats) {
 			stats.realignedTurns = realignedTurns;
 		}
@@ -1125,6 +1126,81 @@ function rehomeGeneratedContinueReplies(state) {
 	return moved;
 }
 
+/**
+ * A duplicated prompt can leave VS Code showing only the later request while response
+ * chunks are still appended one slot early. Repair only when every moved chunk is an
+ * overlapping continuation of the following request's primary response.
+ * @param {any} state reconstructed session (mutated in place)
+ * @returns {number}
+ */
+function repairDuplicatePromptShiftedContinuations(state) {
+	const requests = state && Array.isArray(state.requests) ? state.requests : null;
+	if (!requests) {
+		return 0;
+	}
+	let repaired = 0;
+	for (let i = 0; i < requests.length - 1; i++) {
+		const stale = requests[i];
+		const next = requests[i + 1];
+		if (!stale || !next || stale.__hideFromVisible) {
+			continue;
+		}
+		const staleText = requestText(stale);
+		const nextText = requestText(next);
+		if (!staleText || staleText !== nextText || !stale.result || !next.result) {
+			continue;
+		}
+		const pairs = [];
+		for (let dst = i + 1; dst < requests.length; dst++) {
+			const src = dst - 1;
+			const blockParts = displacedPartsForSource(requests[src], src);
+			if (!blockParts.length) {
+				break;
+			}
+			const primaryBody = renderResponse(primaryResponseParts(requests[dst]), {});
+			const blockBody = renderResponse(blockParts, {});
+			const sourcePrimaryBody = renderResponse(primaryResponseParts(requests[src]), {});
+			if (mergeOverlappingText(sourcePrimaryBody, blockBody)) {
+				break;
+			}
+			const mergedBody = mergeOverlappingText(primaryBody, blockBody);
+			if (!mergedBody) {
+				break;
+			}
+			pairs.push({ src, dst, mergedBody });
+		}
+		if (!pairs.length) {
+			continue;
+		}
+		stale.__hideFromVisible = true;
+		for (const pair of pairs) {
+			if (requests[pair.src] && Array.isArray(requests[pair.src].response)) {
+				requests[pair.src].response = requests[pair.src].response.filter((part) => !(part && part.__displacedFrom === pair.src));
+			}
+			requests[pair.dst].response = [{ value: pair.mergedBody }];
+			repaired++;
+		}
+		i += pairs.length;
+	}
+	return repaired;
+}
+
+/**
+ * @param {any} request
+ */
+function requestText(request) {
+	const text = request && request.message && typeof request.message.text === 'string' ? request.message.text : '';
+	return normWhitespace(text);
+}
+
+/**
+ * @param {any} request
+ * @param {number} index
+ */
+function displacedPartsForSource(request, index) {
+	const response = request && Array.isArray(request.response) ? request.response : [];
+	return response.filter((part) => part && part.__displacedFrom === index);
+}
 /**
  * Generated continue turns can have a small status prefix of their own before VS Code
  * displays the previous request's final text under the continue id. Stop that prefix

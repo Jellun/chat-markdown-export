@@ -7,3 +7,5 @@ __*
 *.vsix
 devnotes.txt
 images/*.svg
+*.jsonl
+correct_order.txt
