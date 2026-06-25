@@ -1290,7 +1290,7 @@ function reflowDisplacedReplies(state) {
 		block.body = renderFinalResponse(block.parts);
 		block.fullBody = renderResponse(block.parts, {});
 	}
-	// Only blocks that render to visible prose are genuine relocated answers.
+	// Only blocks that render to visible prose are genuine relocated-answer candidates.
 	const answerBlocks = blocks.filter((b) => b.body && !/^\s*```[\w-]*\s*$/.test(b.body));
 	if (!answerBlocks.length) {
 		return 0;
@@ -1313,56 +1313,63 @@ function reflowDisplacedReplies(state) {
 		if (turn === lastVisible && turn.isPendingTail && !isAbortedUnfinalized(request)) {
 			continue;
 		}
-		if (request && request.result && turnHasOwnReply(turn)) {
+		if (turnHasOwnReply(turn)) {
 			continue;
 		}
 		holes.push(turn);
 	}
-
-	// Only act when the two sequences line up one-to-one; otherwise stay out of the way.
-	if (!holes.length || holes.length !== answerBlocks.length) {
+	if (!holes.length) {
 		return 0;
 	}
 
-	// Both sequences are in ascending turn order. A genuine desync always recorded a
-	// reply EARLIER than the turn it belongs to, so every block must map to a turn at or
-	// after its source. A block that maps to its own turn is a harmless late flush (the
-	// turn's real reply, just written after a later turn was created); a block that maps
-	// to an EARLIER turn is not this pattern at all, so we bail rather than guess.
-	let genuine = 0;
-	for (let i = 0; i < holes.length; i++) {
-		if (holes[i].origIndex < answerBlocks[i].sourceIndex) {
-			return 0;
+	const moves = [];
+	const usedHoleIndexes = new Set();
+	for (let i = 0; i < answerBlocks.length; i++) {
+		const block = answerBlocks[i];
+		const source = requests[block.sourceIndex];
+		const sourcePrimaryBody = renderResponse(primaryResponseParts(source), {});
+		if (sourcePrimaryBody && mergeOverlappingText(sourcePrimaryBody, block.fullBody)) {
+			continue; // this is just a late continuation of the source turn itself
 		}
-		if (holes[i].origIndex !== answerBlocks[i].sourceIndex) {
-			genuine++;
-		}
-	}
-	if (genuine === 0) {
-		return 0; // every block already sits on its own turn: nothing to relocate
-	}
 
-	for (let i = 0; i < holes.length; i++) {
-		const currentBody = renderResponseForTurn(holes[i], {});
-		answerBlocks[i].alreadyPresent = textContainsNormalized(currentBody, answerBlocks[i].fullBody);
-		answerBlocks[i].mergedBody = answerBlocks[i].alreadyPresent ? '' : mergeOverlappingText(currentBody, answerBlocks[i].fullBody);
-	}
-
-	// Detach every displaced part from its wrong turn first, then re-home the blocks, so
-	// a turn that is both a source and a destination is handled cleanly.
-	for (let i = 0; i < requests.length; i++) {
-		const request = requests[i];
-		if (request && Array.isArray(request.response)) {
-			request.response = request.response.filter((p) => !(p && p.__displacedFrom === i));
-		}
-	}
-	for (let i = 0; i < holes.length; i++) {
-		if (answerBlocks[i].alreadyPresent) {
+		const nextSourceIndex = i + 1 < answerBlocks.length ? answerBlocks[i + 1].sourceIndex : Infinity;
+		const hole = holes.find((candidate) => {
+			return !usedHoleIndexes.has(candidate.origIndex)
+				&& candidate.origIndex > block.sourceIndex
+				&& candidate.origIndex <= nextSourceIndex;
+		});
+		if (!hole) {
 			continue;
 		}
-		const request = holes[i].request;
-		if (answerBlocks[i].mergedBody) {
-			request.response = [{ value: answerBlocks[i].mergedBody }];
+
+		const currentBody = renderResponseForTurn(hole, {});
+		const alreadyPresent = textContainsNormalized(currentBody, block.fullBody);
+		const mergedBody = alreadyPresent ? '' : mergeOverlappingText(currentBody, block.fullBody);
+		if (currentBody && !alreadyPresent && !mergedBody) {
+			continue;
+		}
+		moves.push({ block, hole, alreadyPresent, mergedBody });
+		usedHoleIndexes.add(hole.origIndex);
+	}
+	if (!moves.length) {
+		return 0;
+	}
+
+	// Detach only the displaced blocks that have a clear destination; leave unrelated
+	// late flushes on their original turns.
+	for (const move of moves) {
+		const source = requests[move.block.sourceIndex];
+		if (source && Array.isArray(source.response)) {
+			source.response = source.response.filter((p) => !(p && p.__displacedFrom === move.block.sourceIndex));
+		}
+	}
+	for (const move of moves) {
+		if (move.alreadyPresent) {
+			continue;
+		}
+		const request = move.hole.request;
+		if (move.mergedBody) {
+			request.response = [{ value: move.mergedBody }];
 			continue;
 		}
 		if (!request.result) {
@@ -1370,14 +1377,14 @@ function reflowDisplacedReplies(state) {
 		} else if (!Array.isArray(request.response)) {
 			request.response = [];
 		}
-		for (const part of answerBlocks[i].parts) {
+		for (const part of move.block.parts) {
 			if (part && typeof part === 'object') {
 				delete part.__displacedFrom;
 			}
 			request.response.push(part);
 		}
 	}
-	return genuine;
+	return moves.length;
 }
 
 /**

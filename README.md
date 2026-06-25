@@ -98,7 +98,7 @@ want to hack on it:
   npm install -g @vscode/vsce
   cd chat-markdown-export
   vsce package
-  code --install-extension chat-markdown-export-0.5.19.vsix
+  code --install-extension chat-markdown-export-0.5.20.vsix
   ```
 
 ## Notes & limitations
