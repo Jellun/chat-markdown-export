@@ -1296,28 +1296,7 @@ function reflowDisplacedReplies(state) {
 		return 0;
 	}
 
-	// Blank answerable turns, in display order, that have no reply of their own.
-	const visible = buildVisibleTurns(requests);
-	const lastVisible = visible.length ? visible[visible.length - 1] : null;
-	const holes = [];
-	for (const turn of visible) {
-		const request = turn.request;
-		// Canceled turns intentionally have no reply (they render a Canceled marker).
-		if (request && request.result && request.result.errorDetails && request.result.errorDetails.message) {
-			continue;
-		}
-		if (request && request.__responseMovedToContinue) {
-			continue;
-		}
-		// The actively-streaming last turn is not a hole; it is still being written.
-		if (turn === lastVisible && turn.isPendingTail && !isAbortedUnfinalized(request)) {
-			continue;
-		}
-		if (turnHasOwnReply(turn)) {
-			continue;
-		}
-		holes.push(turn);
-	}
+	const holes = displacedReplyDestinationTurns(requests);
 	if (!holes.length) {
 		return 0;
 	}
@@ -1342,9 +1321,12 @@ function reflowDisplacedReplies(state) {
 			continue;
 		}
 
-		const currentBody = renderResponseForTurn(hole, {});
+		const currentBody = renderPrimaryResponseForTurn(hole);
 		const alreadyPresent = textContainsNormalized(currentBody, block.fullBody);
-		const mergedBody = alreadyPresent ? '' : mergeOverlappingText(currentBody, block.fullBody);
+		let mergedBody = alreadyPresent ? '' : mergeOverlappingText(currentBody, block.fullBody);
+		if (currentBody && !alreadyPresent && !mergedBody && canAppendDisplacedBlockToTurn(hole)) {
+			mergedBody = currentBody + '\n\n' + block.fullBody;
+		}
 		if (currentBody && !alreadyPresent && !mergedBody) {
 			continue;
 		}
@@ -1385,6 +1367,131 @@ function reflowDisplacedReplies(state) {
 		}
 	}
 	return moves.length;
+}
+
+/**
+ * Candidate destination turns for response blocks VS Code appended to an earlier
+ * request. This includes visible blank turns and hidden no-result turns that become
+ * visible once their misplaced reply is restored.
+ * @param {any[]} requests
+ * @returns {{ request: any, origIndex: number, text: string, isPendingTail: boolean }[]}
+ */
+function displacedReplyDestinationTurns(requests) {
+	const visible = buildVisibleTurns(requests);
+	const visibleByIndex = new Map();
+	for (const turn of visible) {
+		visibleByIndex.set(turn.origIndex, turn);
+	}
+	const lastVisible = visible.length ? visible[visible.length - 1] : null;
+	const tailStart = firstPendingTailIndex(requests);
+	const holes = [];
+	for (let i = 0; i < requests.length; i++) {
+		const request = requests[i];
+		if (!request || request.__hideFromVisible) {
+			continue;
+		}
+		let turn = visibleByIndex.get(i);
+		if (!turn) {
+			turn = hiddenDisplacedReplyDestination(requests, i, tailStart);
+			if (!turn) {
+				continue;
+			}
+		}
+		// Canceled turns intentionally have no reply (they render a Canceled marker).
+		if (request.result && request.result.errorDetails && request.result.errorDetails.message) {
+			continue;
+		}
+		if (request.__responseMovedToContinue) {
+			continue;
+		}
+		// The actively-streaming last turn is not a hole; it is still being written.
+		if (turn === lastVisible && turn.isPendingTail && !isAbortedUnfinalized(request)) {
+			continue;
+		}
+		if (turnHasOwnReply(turn) && !canAppendDisplacedBlockToTurn(turn)) {
+			continue;
+		}
+		holes.push(turn);
+	}
+	return holes;
+}
+
+/**
+ * @param {any[]} requests
+ * @param {number} index
+ * @param {number} tailStart
+ * @returns {{ request: any, origIndex: number, text: string, isPendingTail: boolean } | null}
+ */
+function hiddenDisplacedReplyDestination(requests, index, tailStart) {
+	const request = requests[index];
+	const text = requestText(request);
+	if (!text || isGeneratedAgentContinue(text)) {
+		return null;
+	}
+	if (request.result || hasExportableResponseContent(request)) {
+		return null;
+	}
+	if (isLikelyPhantomEmptyTurn(requests, index)) {
+		return null;
+	}
+	return {
+		request,
+		origIndex: index,
+		text,
+		isPendingTail: index >= tailStart,
+	};
+}
+
+/**
+ * Empty duplicate/refinement slots are usually canceled re-send artifacts, not
+ * answerable user turns. Do not treat them as destinations for displaced replies.
+ * @param {any[]} requests
+ * @param {number} index
+ */
+function isLikelyPhantomEmptyTurn(requests, index) {
+	const request = requests[index];
+	if (!request || hasExportableResponseContent(request)) {
+		return false;
+	}
+	const text = requestText(request);
+	if (!text) {
+		return true;
+	}
+	const prev = index > 0 ? requestText(requests[index - 1]) : '';
+	const next = index + 1 < requests.length ? requestText(requests[index + 1]) : '';
+	return text === prev
+		|| text === next
+		|| promptRefinesPrevious(text, next)
+		|| promptRefinesPrevious(prev, text);
+}
+
+/**
+ * A no-result turn can already contain visible progress prose but still be missing
+ * the final answer that VS Code appended to an earlier request.
+ * @param {{ request: any }} turn
+ */
+function canAppendDisplacedBlockToTurn(turn) {
+	const request = turn && turn.request;
+	return !!(request && !request.result && hasExportableResponseContent(request));
+}
+
+/**
+ * @param {{ request: any, continuations?: { request: any }[] }} turn
+ * @returns {string}
+ */
+function renderPrimaryResponseForTurn(turn) {
+	const blocks = [];
+	const add = (request) => {
+		const body = renderResponse(primaryResponseParts(request), {});
+		if (body) {
+			blocks.push(body);
+		}
+	};
+	add(turn && turn.request);
+	for (const continuation of (turn && turn.continuations) || []) {
+		add(continuation && continuation.request);
+	}
+	return blocks.join('\n\n').trim();
 }
 
 /**
