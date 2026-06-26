@@ -19,7 +19,7 @@ Chat Markdown Export is designed for a few everyday VS Code Chat pain points:
 - **Reusable knowledge** — Some chats capture debugging trails, design decisions,
   prompts, summaries, explanations, or standout AI-generated answers worth keeping.
   Export them as individual Markdown files and fold them into your notes or knowledge
-  base for later use.
+  base for later use, or selectively bring them back into new chats as useful context.
 
 ## Commands
 
@@ -96,7 +96,7 @@ want to hack on it:
   npm install -g @vscode/vsce
   cd chat-markdown-export
   vsce package
-  code --install-extension chat-markdown-export-0.5.21.vsix
+  code --install-extension chat-markdown-export-0.5.22.vsix
   ```
 
 ## Notes & limitations
